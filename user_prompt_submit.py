@@ -41,9 +41,13 @@ CANARY = "DELIVERATOR_METADATA_UlVCQkVSRFVDSw"
 # Initialize Logfire
 # Scrubbing disabled - too aggressive (redacts "session", "auth", etc.)
 # Our logs are authenticated with 30-day retention; acceptable risk for debugging visibility
+# CRITICAL: send_to_logfire="if-token-present" disables console output
+# Without this, Logfire writes colored logs to stdout which breaks hook JSON output
 logfire.configure(
     service_name="user-prompt-submit",
     scrubbing=False,
+    send_to_logfire="if-token-present",
+    console=False,  # Explicitly disable console output
 )
 
 
@@ -66,12 +70,17 @@ def main():
 
     short_session = session_id[:8] if session_id else "unknown"
 
+    # Truncate prompt for span name - first 50 chars, single line
+    prompt_preview = prompt[:50].replace("\n", " ").strip()
+    if len(prompt) > 50:
+        prompt_preview += "…"
+
     # ==========================================================
     # ROOT SPAN: The "bar tab" - everything downstream is a child
+    # Span name IS the prompt preview - makes traces easy to find
     # ==========================================================
     with logfire.span(
-        "turn {short_session}",
-        short_session=short_session,
+        prompt_preview,
         _level="info",
     ) as span:
         span.set_attribute("session.id", session_id)
