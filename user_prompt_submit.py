@@ -4,21 +4,25 @@
 # dependencies = [
 #     "redis",
 #     "logfire",
+#     "httpx",
 # ]
 # ///
 """
-Alpha UserPromptSubmit hook - Deliverator metadata injection.
+Alpha UserPromptSubmit hook - one hook to rule them all.
 
 Creates the root span for this turn and outputs metadata for the Deliverator
-to extract and promote to HTTP headers.
+to extract and promote to HTTP headers. Also fetches memories from Intro
+and includes them in the metadata payload for the Loom to inject.
 
 Architecture:
 1. Create a ROOT span (turn:{session_id}) - the "bar tab"
-2. Serialize traceparent for context propagation
-3. Output DELIVERATOR_METADATA JSON block
-4. Write traceparent to Redis for Stop hook to join the trace
+2. Fetch memories from Intro API (if available)
+3. Serialize traceparent for context propagation
+4. Output DELIVERATOR_METADATA JSON block with memories included
+5. Write traceparent to Redis for Stop hook to join the trace
 
-Memory injection is handled by a separate hook (memories.py).
+The Loom extracts memories from metadata and injects them as content blocks
+AFTER the user message. Loom strips metadata before forwarding to Anthropic.
 
 Input (via stdin): JSON with session_id, prompt, transcript_path, etc.
 Output (via stdout): JSON with hookSpecificOutput containing metadata
@@ -28,12 +32,14 @@ import json
 import os
 import sys
 
+import httpx
 import logfire
 import redis
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
 # Configuration
 REDIS_URL = os.environ.get("REDIS_URL", "redis://alpha-pi:6379")
+INTRO_URL = os.environ.get("INTRO_URL", "http://localhost:8100")
 
 # The canary that marks our metadata block
 CANARY = "DELIVERATOR_METADATA_UlVCQkVSRFVDSw"
@@ -49,6 +55,26 @@ logfire.configure(
     send_to_logfire="if-token-present",
     console=False,  # Explicitly disable console output
 )
+
+
+def fetch_memories(prompt: str, session_id: str) -> tuple[list[dict], list[str]]:
+    """Fetch memories from Intro API.
+
+    Returns (memories, queries) or ([], []) on error.
+    Each memory is a dict with: id, created_at, content
+    """
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            response = client.post(
+                f"{INTRO_URL}/prompt",
+                json={"message": prompt, "session_id": session_id},
+            )
+            if response.status_code == 200:
+                data = response.json()
+                return data.get("memories", []), data.get("queries", [])
+    except Exception as e:
+        logfire.debug("Failed to fetch memories from Intro", error=str(e))
+    return [], []
 
 
 def main():
@@ -98,6 +124,20 @@ def main():
             prompt_preview=prompt[:200] + "..." if len(prompt) > 200 else prompt,
         )
 
+        # ==========================================================
+        # Fetch memories from Intro
+        # ==========================================================
+        memories, queries = fetch_memories(prompt, session_id)
+        if memories:
+            logfire.info(
+                "Fetched memories",
+                session=short_session,
+                count=len(memories),
+                queries=queries,
+            )
+            span.set_attribute("memories.count", len(memories))
+            span.set_attribute("memories.queries", queries)
+
         # Serialize context for propagation
         # Logfire wraps OTel, so we can still use TraceContextTextMapPropagator
         headers = {}
@@ -131,6 +171,12 @@ def main():
         loom_pattern = os.environ.get("LOOM_PATTERN")
         if loom_pattern:
             metadata["pattern"] = loom_pattern
+
+        # Include memories in metadata for the Loom to inject
+        # Each memory has: id, created_at, content
+        if memories:
+            metadata["memories"] = memories
+            metadata["memory_queries"] = queries
 
         output = {
             "hookSpecificOutput": {
