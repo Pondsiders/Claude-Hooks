@@ -5,6 +5,7 @@
 #     "redis",
 #     "logfire",
 #     "httpx",
+#     "pendulum",
 # ]
 # ///
 """
@@ -34,6 +35,7 @@ import sys
 
 import httpx
 import logfire
+import pendulum
 import redis
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
@@ -175,10 +177,14 @@ def main():
         # ==========================================================
         # Build metadata for the Deliverator
         # ==========================================================
+        # PSO-8601 timestamp: "Mon Jan 27 2026, 12:32 PM"
+        sent_at = pendulum.now("America/Los_Angeles").format("ddd MMM D YYYY, h:mm A")
+
         metadata = {
             "canary": CANARY,
             "session_id": session_id,
             "traceparent": traceparent,
+            "sent_at": sent_at,
         }
 
         # Pattern selection: LOOM_PATTERN env var controls which pattern the Great Loom uses

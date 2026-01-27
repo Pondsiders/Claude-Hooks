@@ -5,6 +5,7 @@
 #     "pondside @ file:///Pondside/Basement/SDK",
 #     "redis",
 #     "logfire",
+#     "pendulum",
 # ]
 # ///
 """
@@ -49,6 +50,7 @@ from pathlib import Path
 import sys
 
 import logfire
+import pendulum
 import redis
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
@@ -158,11 +160,15 @@ def build_deliverator_metadata(session_id: str, span) -> str | None:
         span.set_attribute("traceparent", traceparent)
 
     # Build metadata payload
+    # PSO-8601 timestamp: "Mon Jan 27 2026, 12:32 PM"
+    sent_at = pendulum.now("America/Los_Angeles").format("ddd MMM D YYYY, h:mm A")
+
     metadata = {
         "canary": CANARY,
         "session_id": session_id,
         "traceparent": traceparent,
         "pattern": loom_pattern,
+        "sent_at": sent_at,
     }
 
     logger.info(f"Built Deliverator metadata: pattern={loom_pattern}, session={session_id[:8]}")
