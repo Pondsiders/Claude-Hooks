@@ -4,26 +4,39 @@
 # dependencies = [
 #     "pondside @ file:///Pondside/Basement/SDK",
 #     "redis",
+#     "logfire",
 # ]
 # ///
 """
 Alpha SessionStart hook.
 
-The ONE SessionStart hook that does everything:
-1. Exports CLAUDE_SESSION_ID to the environment (via hook-0.sh)
-2. (Future) Fetches last memory, weather, todos, etc.
+Handles all session start events (startup, resume, clear, compact).
 
-This hook is idempotent—it may be called multiple times for the same session
-(on resume, compact, etc.) and should handle that gracefully.
+KEY FEATURE: On compact, injects Deliverator metadata so the Loom knows
+to apply AlphaPattern. This ensures the continuation prompt gets rewritten
+to "stop and check in" instead of "continue without asking questions."
+
+The problem this solves:
+- UserPromptSubmit doesn't fire for SDK-generated continuation prompts
+- Without metadata, the Loom defaults to PassthroughPattern
+- PassthroughPattern doesn't rewrite continuation instructions
+- Alpha plows ahead without checking in after compaction
+
+The fix:
+- SessionStart:compact fires BEFORE the continuation request is built
+- We inject the same metadata payload that UserPromptSubmit would
+- Deliverator promotes x-loom-pattern header
+- Loom applies AlphaPattern with continuation rewriting
+
+Other responsibilities:
+1. Exports CLAUDE_SESSION_ID to the environment (via hook-0.sh)
+2. Seeds transcript position for Stop hook
 
 BRUTE FORCE FIX (Jan 17, 2026):
 Claude Code has a bug where on resume, CLAUDE_ENV_FILE points to a NEW
 ephemeral directory instead of the original session's directory. So we
 ignore CLAUDE_ENV_FILE entirely and write directly to:
     ~/.claude/session-env/{session_id}/hook-0.sh
-
-This ensures environment variables are available regardless of whether
-it's a fresh start or a resume.
 
 Input (via stdin): JSON with session_id, transcript_path, source, etc.
 Output (via stdout): JSON with hookSpecificOutput.additionalContext
@@ -35,12 +48,17 @@ import os
 from pathlib import Path
 import sys
 
+import logfire
 import redis
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
 from pondside.telemetry import init, get_tracer
 
 # Redis connection
 REDIS_URL = os.environ.get("REDIS_URL", "redis://alpha-pi:6379")
+
+# The canary that marks our metadata block (must match user_prompt_submit.py)
+CANARY = "DELIVERATOR_METADATA_UlVCQkVSRFVDSw"
 
 # Initialize telemetry
 init("session-start-hook")
@@ -113,7 +131,54 @@ def setup_environment(session_id: str) -> bool:
         return False
 
 
+def build_deliverator_metadata(session_id: str, span) -> str | None:
+    """Build the Deliverator metadata payload for pattern routing.
+
+    This is the same format as user_prompt_submit.py uses, so the
+    Deliverator can extract and promote to HTTP headers.
+
+    Returns JSON string or None if we can't build it.
+    """
+    if not session_id:
+        return None
+
+    # Get pattern from environment (same as user_prompt_submit.py)
+    loom_pattern = os.environ.get("LOOM_PATTERN")
+    if not loom_pattern:
+        logger.warning("LOOM_PATTERN not set, can't build metadata")
+        return None
+
+    # Generate traceparent for distributed tracing
+    # This creates a new trace for the compact continuation
+    headers = {}
+    TraceContextTextMapPropagator().inject(headers)
+    traceparent = headers.get("traceparent", "")
+
+    if traceparent:
+        span.set_attribute("traceparent", traceparent)
+
+    # Build metadata payload
+    metadata = {
+        "canary": CANARY,
+        "session_id": session_id,
+        "traceparent": traceparent,
+        "pattern": loom_pattern,
+    }
+
+    logger.info(f"Built Deliverator metadata: pattern={loom_pattern}, session={session_id[:8]}")
+    return json.dumps(metadata)
+
+
 def main():
+    # Initialize Logfire for distributed tracing
+    # Must happen before we try to inject traceparent
+    logfire.configure(
+        service_name="session-start-hook",
+        scrubbing=False,
+        send_to_logfire="if-token-present",
+        console=False,
+    )
+
     with tracer.start_as_current_span("session-start") as span:
         # Read input from stdin
         try:
@@ -140,24 +205,34 @@ def main():
         span.set_attribute("position_seeded", pos_ok)
 
         # --- Task 3: Build additional context ---
-        # (Future: fetch last memory, weather, todos, etc.)
-        context_parts = []
+        additional_context = None
 
-        # For now, just confirm we're alive
-        # context_parts.append(f"Session: {session_id[:8]}... ({source})")
+        # ON COMPACT: Inject Deliverator metadata so Loom applies AlphaPattern
+        # This is the fix for the continuation prompt gap
+        if source == "compact":
+            logger.info("Compact detected - injecting Deliverator metadata for pattern routing")
+            span.set_attribute("inject_metadata", True)
+            additional_context = build_deliverator_metadata(session_id, span)
+            if additional_context:
+                logger.info("Metadata payload ready for Deliverator extraction")
+            else:
+                logger.warning("Failed to build metadata - continuation will use PassthroughPattern")
 
         # --- Output ---
-        if context_parts:
+        if additional_context:
             output = {
                 "hookSpecificOutput": {
                     "hookEventName": "SessionStart",
-                    "additionalContext": "\n".join(context_parts)
+                    "additionalContext": additional_context
                 }
             }
         else:
             output = {}
 
         print(json.dumps(output))
+
+    # Force flush telemetry before exit
+    logfire.force_flush()
 
 
 if __name__ == "__main__":

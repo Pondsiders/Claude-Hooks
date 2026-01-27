@@ -62,12 +62,19 @@ def fetch_memories(prompt: str, session_id: str) -> tuple[list[dict], list[str]]
 
     Returns (memories, queries) or ([], []) on error.
     Each memory is a dict with: id, created_at, content
+
+    Injects traceparent header so Intro's spans become children of this hook's span.
     """
     try:
+        # Inject current trace context into headers for distributed tracing
+        headers = {}
+        TraceContextTextMapPropagator().inject(headers)
+
         with httpx.Client(timeout=10.0) as client:
             response = client.post(
                 f"{INTRO_URL}/prompt",
                 json={"message": prompt, "session_id": session_id},
+                headers=headers,
             )
             if response.status_code == 200:
                 data = response.json()
@@ -125,9 +132,17 @@ def main():
         )
 
         # ==========================================================
-        # Fetch memories from Intro
+        # Fetch memories from Intro (ONLY for Alpha pattern)
+        # Intro is Alpha's metacognitive layer - it shouldn't watch Iota or other patterns
         # ==========================================================
-        memories, queries = fetch_memories(prompt, session_id)
+        memories, queries = [], []
+        loom_pattern = os.environ.get("LOOM_PATTERN")
+
+        if loom_pattern == "alpha":
+            memories, queries = fetch_memories(prompt, session_id)
+        else:
+            logfire.debug("Skipping Intro (pattern is not alpha)", pattern=loom_pattern)
+
         if memories:
             logfire.info(
                 "Fetched memories",
@@ -168,7 +183,7 @@ def main():
 
         # Pattern selection: LOOM_PATTERN env var controls which pattern the Great Loom uses
         # e.g., LOOM_PATTERN=iota for Iota, LOOM_PATTERN=passthrough for direct Claude access
-        loom_pattern = os.environ.get("LOOM_PATTERN")
+        # (loom_pattern already fetched above for Intro gating)
         if loom_pattern:
             metadata["pattern"] = loom_pattern
 

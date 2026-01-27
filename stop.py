@@ -256,12 +256,17 @@ def main():
             if lines:
                 logger.info(f"Read {len(lines)} lines from pos {start_pos} to {new_pos}")
 
-                # Call Intro 2.0 /stop with turn messages
-                # Pass traceparent for OTel context propagation
-                turn = extract_turn_messages(lines)
-                if turn:
-                    call_intro_stop(session_id, turn, traceparent or "")
-                    span.set_attribute("intro2_turn_messages", len(turn))
+                # Call Intro 2.0 /stop with turn messages (ONLY for Alpha pattern)
+                # Intro is Alpha's metacognitive layer - it shouldn't watch Iota or other patterns
+                loom_pattern = os.environ.get("LOOM_PATTERN")
+
+                if loom_pattern == "alpha":
+                    turn = extract_turn_messages(lines)
+                    if turn:
+                        call_intro_stop(session_id, turn, traceparent or "")
+                        span.set_attribute("intro2_turn_messages", len(turn))
+                else:
+                    logger.debug(f"Skipping Intro (pattern is {loom_pattern}, not alpha)")
 
             else:
                 logger.info(f"No new content (pos {start_pos} -> {new_pos})")
