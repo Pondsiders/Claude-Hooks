@@ -46,6 +46,10 @@ INTRO_URL = os.environ.get("INTRO_URL", "http://localhost:8100")
 # The canary that marks our metadata block
 CANARY = "DELIVERATOR_METADATA_UlVCQkVSRFVDSw"
 
+# Human session tracking for Routines
+HUMAN_SESSION_KEY = "routine:human_session"
+HUMAN_SESSION_TTL = 24 * 60 * 60  # 24 hours
+
 # Initialize Logfire
 # Scrubbing disabled - too aggressive (redacts "session", "auth", etc.)
 # Our logs are authenticated with 30-day retention; acceptable risk for debugging visibility
@@ -134,11 +138,29 @@ def main():
         )
 
         # ==========================================================
+        # Parse pattern and client from ANTHROPIC_CUSTOM_HEADERS
+        # Headers are newline-separated: "x-loom-client: duckpond\nx-loom-pattern: alpha"
+        # ==========================================================
+        custom_headers = os.environ.get("ANTHROPIC_CUSTOM_HEADERS", "")
+        loom_pattern = None
+        loom_client = None
+
+        for line in custom_headers.split("\n"):
+            line = line.strip()
+            if line.lower().startswith("x-loom-pattern:"):
+                loom_pattern = line.split(":", 1)[1].strip()
+            elif line.lower().startswith("x-loom-client:"):
+                loom_client = line.split(":", 1)[1].strip()
+
+        # Fallback to env var for backwards compatibility (e.g., LOOM_PATTERN=alpha claude)
+        if not loom_pattern:
+            loom_pattern = os.environ.get("LOOM_PATTERN")
+
+        # ==========================================================
         # Fetch memories from Intro (ONLY for Alpha pattern)
         # Intro is Alpha's metacognitive layer - it shouldn't watch Iota or other patterns
         # ==========================================================
         memories, queries = [], []
-        loom_pattern = os.environ.get("LOOM_PATTERN")
 
         if loom_pattern == "alpha":
             memories, queries = fetch_memories(prompt, session_id)
@@ -171,6 +193,17 @@ def main():
         try:
             r = redis.from_url(REDIS_URL)
             r.set(f"turn_context:{session_id}", traceparent, ex=300)
+
+            # ==========================================================
+            # Human session tracking for Routines
+            # ==========================================================
+            # Only store session ID if this is a Duckpond session.
+            # This enables the "to self" routine to fork from the day's conversation.
+            # (loom_client already parsed above from ANTHROPIC_CUSTOM_HEADERS)
+            if loom_client == "duckpond":
+                r.setex(HUMAN_SESSION_KEY, HUMAN_SESSION_TTL, session_id)
+                logfire.debug("Stored human session", session=short_session)
+
         except Exception as e:
             logfire.warning("Failed to write traceparent to Redis", error=str(e))
 
